@@ -1129,6 +1129,32 @@ class AzureChatCompletion(BaseAzureLLM, BaseLLM):
 
         return base_url_with_deployment
 
+    @staticmethod
+    def _set_azure_ad_token_header_for_image_generation(
+        headers: dict,
+        api_key: Optional[str],
+        azure_ad_token: Optional[str],
+        azure_ad_token_provider: Optional[Callable],
+        azure_client_params: Dict[str, Any],
+    ) -> None:
+        if api_key is not None:
+            return
+
+        resolved_azure_ad_token = azure_ad_token or azure_client_params.get(
+            "azure_ad_token"
+        )
+        resolved_azure_ad_token_provider = (
+            azure_ad_token_provider
+            or azure_client_params.get("azure_ad_token_provider")
+        )
+
+        if resolved_azure_ad_token is None and resolved_azure_ad_token_provider:
+            resolved_azure_ad_token = resolved_azure_ad_token_provider()
+
+        if resolved_azure_ad_token:
+            headers.pop("api-key", None)
+            headers["Authorization"] = f"Bearer {resolved_azure_ad_token}"
+
     async def aimage_generation(
         self,
         data: dict,
@@ -1265,12 +1291,6 @@ class AzureChatCompletion(BaseAzureLLM, BaseLLM):
                     status_code=422, message="max retries must be an int"
                 )
 
-            if api_key is None and azure_ad_token_provider is not None:
-                azure_ad_token = azure_ad_token_provider()
-                if azure_ad_token:
-                    headers.pop("api-key", None)
-                    headers["Authorization"] = f"Bearer {azure_ad_token}"
-
             # init AzureOpenAI Client
             azure_client_params: Dict[str, Any] = self.initialize_azure_sdk_client(
                 litellm_params=litellm_params or {},
@@ -1279,6 +1299,13 @@ class AzureChatCompletion(BaseAzureLLM, BaseLLM):
                 api_version=api_version,
                 api_base=api_base,
                 is_async=False,
+            )
+            self._set_azure_ad_token_header_for_image_generation(
+                headers=headers,
+                api_key=api_key,
+                azure_ad_token=azure_ad_token,
+                azure_ad_token_provider=azure_ad_token_provider,
+                azure_client_params=azure_client_params,
             )
             if aimg_generation is True:
                 return self.aimage_generation(data=data, input=input, logging_obj=logging_obj, model_response=model_response, api_key=api_key, client=client, azure_client_params=azure_client_params, timeout=timeout, headers=headers, model=model)  # type: ignore
