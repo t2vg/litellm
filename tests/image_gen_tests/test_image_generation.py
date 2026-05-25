@@ -415,3 +415,42 @@ async def test_azure_image_generation_request_body():
         call_args = mock_post.call_args
         request_json = call_args.kwargs.get("json", {})
         assert request_json == expected_body
+
+
+@pytest.mark.asyncio
+async def test_azure_image_generation_uses_resolved_ad_token_provider(monkeypatch):
+    """Azure image generation REST calls should use the token provider resolved from MI auth."""
+    from litellm import aimage_generation
+
+    monkeypatch.setattr(litellm, "api_key", None)
+    monkeypatch.setattr(litellm, "azure_key", None)
+    monkeypatch.setattr(litellm, "enable_azure_ad_token_refresh", True)
+    monkeypatch.setenv("AZURE_CLIENT_ID", "test-client-id")
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_AD_TOKEN", raising=False)
+
+    with (
+        patch(
+            "litellm.llms.azure.common_utils.get_azure_ad_token_provider",
+            return_value=lambda: "test-mi-token",
+        ),
+        patch(
+            "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+            new_callable=AsyncMock,
+        ) as mock_post,
+    ):
+        mock_post.side_effect = Exception("test")
+
+        with pytest.raises(Exception):
+            await aimage_generation(
+                model="azure/gpt-image-2",
+                prompt="test prompt",
+                api_base="https://example.azure.com",
+                api_version="2025-04-01-preview",
+            )
+
+        mock_post.assert_called_once()
+        request_headers = mock_post.call_args.kwargs.get("headers", {})
+        assert request_headers["Authorization"] == "Bearer test-mi-token"
+        assert "api-key" not in request_headers
