@@ -1458,6 +1458,57 @@ try:
             f"Selected UI path {ui_path} is invalid or incomplete. UI may not work correctly."
         )
 
+    @contextlib.contextmanager
+    def _ui_filesystem_write_lock(ui_root: str):
+        """
+        Serialize startup-time UI rewrites across uvicorn/gunicorn workers.
+
+        StaticFiles can serve a chunk from one worker while another worker is
+        importing this module. Holding this lock and using os.replace below
+        avoids exposing truncated files during SERVER_ROOT_PATH rewrites.
+        """
+
+        try:
+            lock_file = open(os.path.join(ui_root, ".litellm_ui_rewrite.lock"), "a")
+        except OSError as e:
+            verbose_proxy_logger.warning(
+                f"Could not create UI rewrite lock for {ui_root}: {e}. "
+                "Continuing without the cross-worker lock."
+            )
+            yield
+            return
+
+        fcntl_module = None
+        try:
+            try:
+                import fcntl
+
+                fcntl_module = fcntl
+                fcntl_module.flock(lock_file.fileno(), fcntl_module.LOCK_EX)
+            except ImportError:
+                fcntl_module = None
+            except OSError as e:
+                verbose_proxy_logger.warning(
+                    f"Could not acquire UI rewrite lock for {ui_root}: {e}. "
+                    "Continuing without the cross-worker lock."
+                )
+                fcntl_module = None
+            yield
+        finally:
+            if fcntl_module is not None:
+                fcntl_module.flock(lock_file.fileno(), fcntl_module.LOCK_UN)
+            lock_file.close()
+
+    def _write_text_file_atomically(file_path: str, content: str) -> None:
+        temp_path = f"{file_path}.{os.getpid()}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(temp_path, file_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(temp_path)
+
     # Only modify files if a custom server root path is set AND filesystem is writable
     if server_root_path and server_root_path != "/":
         # Check if UI path is writable
@@ -1471,45 +1522,50 @@ try:
             )
         else:
             # Iterate through files in the UI directory
-            for root, dirs, files in os.walk(ui_path):
-                for filename in files:
-                    file_path = os.path.join(root, filename)
-                    # Skip binary files and files that don't need path replacement
-                    if filename.endswith(
-                        (
-                            ".png",
-                            ".jpg",
-                            ".jpeg",
-                            ".gif",
-                            ".ico",
-                            ".woff",
-                            ".woff2",
-                            ".ttf",
-                            ".eot",
-                        )
-                    ):
-                        continue
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            content = f.read()
+            with _ui_filesystem_write_lock(ui_path):
+                for root, dirs, files in os.walk(ui_path):
+                    for filename in files:
+                        file_path = os.path.join(root, filename)
+                        # Skip binary files and files that don't need path replacement
+                        if filename.endswith(
+                            (
+                                ".png",
+                                ".jpg",
+                                ".jpeg",
+                                ".gif",
+                                ".ico",
+                                ".woff",
+                                ".woff2",
+                                ".ttf",
+                                ".eot",
+                            )
+                        ):
+                            continue
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                content = f.read()
 
-                        # Replace the asset prefix with the server root path
-                        modified_content = content.replace(
-                            f"{litellm_asset_prefix}",
-                            f"{server_root_path}",
-                        )
+                            # Replace the asset prefix with the server root path
+                            modified_content = content.replace(
+                                f"{litellm_asset_prefix}",
+                                f"{server_root_path}",
+                            )
 
-                        # Replace the /.well-known/litellm-ui-config with the server root path
-                        modified_content = modified_content.replace(
-                            "/litellm/.well-known/litellm-ui-config",
-                            f"{server_root_path}/.well-known/litellm-ui-config",
-                        )
+                            # Replace the /.well-known/litellm-ui-config with the server root path
+                            modified_content = modified_content.replace(
+                                "/litellm/.well-known/litellm-ui-config",
+                                f"{server_root_path}/.well-known/litellm-ui-config",
+                            )
 
-                        with open(file_path, "w", encoding="utf-8") as f:
-                            f.write(modified_content)
-                    except (UnicodeDecodeError, PermissionError, OSError):
-                        # Skip binary files or files we can't write to
-                        continue
+                            if modified_content == content:
+                                continue
+
+                            _write_text_file_atomically(
+                                file_path=file_path, content=modified_content
+                            )
+                        except (UnicodeDecodeError, PermissionError, OSError):
+                            # Skip binary files or files we can't write to
+                            continue
 
     # # Mount the _next directory at the root level
     app.mount(
