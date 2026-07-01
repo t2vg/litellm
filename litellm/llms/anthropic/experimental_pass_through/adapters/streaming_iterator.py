@@ -118,6 +118,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 if chunk == "None" or chunk is None:
                     raise Exception
 
+                if not chunk.choices and getattr(chunk, "usage", None) is None:
+                    continue
+
                 should_start_new_block = self._should_start_new_content_block(chunk)
                 if should_start_new_block:
                     self._increment_content_block_index()
@@ -257,6 +260,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             async for chunk in self.completion_stream:
                 if chunk == "None" or chunk is None:
                     raise Exception
+
+                if not chunk.choices and getattr(chunk, "usage", None) is None:
+                    continue
 
                 # Check if we need to start a new content block
                 should_start_new_block = self._should_start_new_content_block(chunk)
@@ -470,6 +476,10 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         from .transformation import LiteLLMAnthropicMessagesAdapter
 
         # Example logic - customize based on your needs:
+        # Usage-only / keepalive chunks carry no choices (choices=[]), they
+        # don't open a new content block. See #30761.
+        if not chunk.choices:
+            return False
         # If chunk indicates a tool call
         if chunk.choices[0].finish_reason is not None:
             return False
